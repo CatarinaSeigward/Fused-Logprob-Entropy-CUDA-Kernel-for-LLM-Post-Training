@@ -1,0 +1,15 @@
+.venv/
+build/
+dist/
+*.egg-info/
+__pycache__/
+*.pyc
+*.pyd
+*.so
+*.obj
+*.lib
+*.exp
+.pytest_cache/
+bench/results/
+bench/plots/
+bench/ncu/

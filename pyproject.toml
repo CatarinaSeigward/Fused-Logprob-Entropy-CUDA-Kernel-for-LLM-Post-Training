@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=64", "torch>=2.4", "ninja"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kernel_opt"
+version = "0.0.1"
+description = "Fused logprob+entropy CUDA kernel for LLM post-training (GRPO/DPO/SFT-eval)"
+requires-python = ">=3.10"
+
+[tool.setuptools]
+package-dir = {"" = "python"}
+
+[tool.setuptools.packages.find]
+where = ["python"]
