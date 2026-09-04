@@ -94,6 +94,10 @@ This work contributes:
 5. An empirical finding that — as a free byproduct of fp32 register-level
    accumulation — K1 is strictly more accurate than TRL's bf16 path by
    4–6 orders of magnitude against fp32 ground truth.
+6. A Nsight Compute analysis showing that the open-source baseline's slowness
+   is **traffic amplification** (8.36× redundant DRAM passes across 43 kernel
+   launches), not per-kernel inefficiency — correcting a plausible but wrong
+   explanation that this work itself had published earlier.
 
 ---
 
@@ -309,25 +313,44 @@ K1 backward vs full PyTorch autograd (eager reference, with grad), bf16:
 | (1024, 152k)     |         41.10 ms  |        3.14 ms  |**13.1×** |
 | (4096,  32k)     |         33.43 ms  |        2.33 ms  |**14.3×** |
 
-### 4.2 DRAM bandwidth utilization
+### 4.2 DRAM bandwidth and traffic (Nsight Compute measured)
 
-For a memory-bound kernel, the meaningful upper bound on throughput is
-`bytes_streamed / peak_bandwidth`. RTX 4060 Laptop peak is 256 GB/s.
-Effective bandwidth measured as `bytes_read / latency`:
+For a memory-bound kernel the ceiling is `bytes_streamed / peak_bandwidth`
+(256 GB/s on this device). Profiling with Nsight Compute 2024.3.2 gives both
+the achieved bandwidth and — critically — the *actual* DRAM traffic:
 
-| Backend (bf16, B·S=1024, V=152k) | GB/s  | % of 256 GB/s peak |
-|----------------------------------|------:|-------------------:|
-| **K1 forward**                   | 197.6 |          **77.2%** |
-| **K1 backward**                  | 198.6 |          **77.6%** |
-| TRL eager                        |  22.8 |               8.9% |
-| PyTorch separate                 |  28.2 |              11.0% |
-| Naive (1 thread/row)             |  32.1 |              12.5% |
+| Backend (bf16, B·S=1024, V=128k) | GB/s  | % of peak | Traffic vs minimum | Launches |
+|----------------------------------|------:|----------:|-------------------:|---------:|
+| **K1 forward**                   | 176.2 |     68.8% |          **1.00×** |    **1** |
+| **K1 backward**                  | 231.6 |     90.5% |              0.97× |    **1** |
+| TRL eager                        | 225.9 |     88.2% |          **8.36×** |   **43** |
+| Naive (1 thread/row)             |  26.4 |     10.3% |              1.00× |        1 |
 
-Across the full sweep, K1 forward peaks at **82.6%** of peak bandwidth at
-(4096, 32k), and K1 backward peaks at **87.8%** at the same shape. The
-remaining ~15% gap to the hardware ceiling reflects launch overhead, residual
-non-vectorized loads (8-byte vector loads not yet implemented), and the
-fundamental cost of two streaming passes (forward) or read+write (backward).
+Two results here overturned our own earlier analysis:
+
+1. **TRL's kernels are not inefficient.** They reach 88.2% of peak DRAM
+   bandwidth — comparable to ours. An earlier draft of this work reported them
+   at ~9% of peak, a figure obtained by dividing *our* modeled byte count by
+   *their* measured latency. That was an artifact of an unvalidated assumption.
+   The real problem is that TRL streams the logits tensor **8.36 times across
+   43 kernel launches**: `entropy_from_logits` alone runs a five-kernel
+   elementwise chain over each of eight 128-row chunks.
+
+2. **The naive kernel isolates occupancy as the variable.** It moves identical
+   bytes (1.00× minimum, same as K1) and computes identical math, yet runs
+   6.7× slower. ncu attributes this entirely to occupancy: **8.3% vs 97.8%**.
+   One thread per row launches 1024 threads on a device that schedules ~36,000.
+
+K1 forward peaks at **73.4%** of DRAM bandwidth (4096×32k) and backward at
+**91.4%**. The forward's larger gap to the ceiling comes from its warp- and
+block-level reduction phases; the backward is purely pointwise and therefore
+closer to a pure streaming copy. Non-vectorized loads are the next lever for
+both.
+
+Nsight Compute also validated the benchmark harness's byte-accounting model:
+modeled versus measured DRAM traffic agree to within **0.4%** on every forward
+shape, so the harness's effective-bandwidth numbers rest on a verified
+assumption rather than an estimate.
 
 ### 4.3 Numerical accuracy: an unanticipated win
 
@@ -460,9 +483,10 @@ schedule. The following are deliberate scope cuts or open follow-ups:
    `torch.autograd.Function` only, which causes a Dynamo graph break (with a
    warning) when used inside `torch.compile`. The result is correct but not
    single-graph-fused. Estimated 1 day.
-5. **No Nsight Compute screenshots.** Windows requires admin permissions
-   for GPU performance counter access; the bench harness measures effective
-   bandwidth as a numerical proxy.
+5. **Profiling covers one GPU generation.** Nsight Compute data (Section 4.2)
+   was collected on sm_89 only. The interesting cross-architecture question —
+   how the 8.36× traffic amplification and the occupancy cliff behave on
+   Hopper's larger L2 and higher bandwidth — is unanswered.
 6. **No Triton port for direct Liger comparison.** K1 vs.
    `LigerFusedLinearCrossEntropy` would require either porting Liger to take
    already-computed logits or extending K1 to fuse with the LM-head

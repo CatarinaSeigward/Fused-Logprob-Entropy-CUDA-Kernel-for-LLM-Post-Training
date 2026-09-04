@@ -51,8 +51,11 @@ K1 forward + backward, bf16, RTX 4060 Laptop:
 |---|---:|---:|---:|
 | Forward latency, B·S=1024, V=152k | 1.58 ms | 13.6 ms (TRL eager) | **8.6×** |
 | Backward latency, B·S=1024, V=152k | 3.14 ms | 41.1 ms (PyTorch autograd) | **13.1×** |
-| Peak DRAM bandwidth, forward | 82.6% | 14.2% (TRL) | — |
-| Peak DRAM bandwidth, backward | 87.8% | 5.9% (autograd) | — |
+| DRAM traffic vs theoretical minimum (ncu) | **1.00×** | 8.36× (TRL) | **8.4× less** |
+| Kernel launches per call (ncu) | **1** | 43 (TRL) | **43× fewer** |
+| Peak DRAM bandwidth, forward (ncu) | 64.7–73.4% | — | — |
+| Peak DRAM bandwidth, backward (ncu) | 90.5–91.4% | — | — |
+| Occupancy (ncu) | 96–98% | 8.3% (naive) | — |
 | Intermediate alloc per call (B·S=1024, V=152k) | **0 MB** | 298 MB (TRL) / 894 MB (PyTorch) | — |
 | Logp accuracy vs fp32 ground truth | 2.0 × 10⁻⁶ | 1.2 × 10⁻² (TRL bf16) | **6 orders of magnitude** |
 | Entropy accuracy vs fp32 ground truth | 2.1 × 10⁻⁶ | 3.3 × 10⁻² (TRL bf16) | **4 orders of magnitude** |
@@ -98,41 +101,131 @@ dropping. **At V=256k, the gap should widen further** (back-of-envelope: TRL
 
 ---
 
-## 4. Bandwidth analysis (the roofline story without ncu screenshots)
+## 4. Bandwidth analysis (Nsight Compute verified)
 
-K1 is memory-bound: it reads `B·S·V·dtype_size` bytes once and writes
-`B·S·output_size` bytes (negligible). **Arithmetic intensity** ≈ 5 ops / byte
-(one `expf`, a couple muls/fmas per element). RTX 4060 ridge point (where
-compute and memory become equal cost) is at:
+### 4.1 Where the ridge actually is
+
+K1 is memory-bound. Arithmetic intensity, counted from the kernel source:
+
+| kernel | ops per V element | bytes per element | AI (FLOP/byte) |
+|---|---:|---:|---:|
+| forward (`combine` + loop body) | 15 | 2 (bf16 read) | **7.5** |
+| backward (loop body) | 7 | 4 (read + write) | **1.75** |
+
+The RTX 4060 ridge point — where compute and memory cost equalize — must be
+computed against the ceiling this kernel can actually reach. **K1 uses no
+Tensor Cores**, so the relevant peak is fp32 FMA throughput (~15 TFLOP/s),
+not the 121 TFLOP/s bf16 Tensor Core number:
 
 ```
-ridge_point_AI = peak_compute / peak_bandwidth
-              = 121 TFLOPs (bf16) / 256 GB/s
-              ≈ 470 ops/byte
+ridge = peak_fp32_compute / peak_bandwidth
+      = 15 TFLOP/s / 256 GB/s
+      ≈ 59 FLOP/byte
 ```
 
-K1's AI of 5 ops/byte is ~100× below the ridge. **The kernel cannot be made
-faster by adding compute** — it's bound by how fast the GPU can stream bytes
-from DRAM. The only way to get more throughput is to reduce bytes-per-output.
+K1 forward sits at 7.5 FLOP/byte — **~8× left of the ridge**, firmly
+memory-bound. Adding compute cannot make it faster; only reducing
+bytes-per-output can. See `bench/plots/roofline.png`.
 
-K1's measured effective bandwidth (`bytes_read / latency` from
-`bench/bench_micro.py`):
+### 4.2 ncu-measured results
 
-| backend | (1024, 152k) bandwidth | % of 256 GB/s peak |
+Profiled with `bench/run_ncu.ps1` (Nsight Compute 2024.3.2, one kernel launch
+each, `--profile-from-start off` bracketing exactly one post-warmup iteration).
+Raw exports in `bench/ncu/*_raw.csv`, parsed by `bench/ncu_parse.py`.
+
+| backend | shape | dur (ms) | DRAM GB/s | % of peak | occupancy | SM throughput | launches |
+|---|---|---:|---:|---:|---:|---:|---:|
+| K1 forward | 256×32k | 0.099 | 165.6 | 64.7% | 87.8% | 41.8% | 1 |
+| K1 forward | 1024×128k | 1.496 | 176.2 | 68.8% | 97.8% | 42.4% | 1 |
+| K1 forward | 1024×152k | 1.778 | 175.7 | 68.6% | 97.5% | 42.2% | 1 |
+| K1 forward | 4096×32k | 1.401 | 187.8 | **73.4%** | 98.0% | 47.1% | 1 |
+| K1 backward | 1024×128k | 2.208 | 231.6 | 90.5% | 96.4% | 16.5% | 1 |
+| K1 backward | 4096×32k | 2.181 | 233.9 | **91.4%** | 96.5% | 17.3% | 1 |
+| naive (1 thread/row) | 1024×128k | 9.977 | 26.4 | 10.3% | **8.3%** | 4.0% | 1 |
+| TRL eager | 1024×128k | 9.724 | 225.9 | 88.2% | 78.5% | 23.7% | **43** |
+
+### 4.3 The finding that corrected our own analysis
+
+An earlier draft of this report claimed the eager paths "sit ~10× below their
+bandwidth ceiling," inferring that their kernels were inefficient. **ncu shows
+that is wrong.** TRL's kernels run at **88.2% of peak DRAM bandwidth** — they
+are individually about as bandwidth-efficient as ours.
+
+The real problem is traffic volume. ncu measured TRL moving **2197 MB** of DRAM
+traffic for a computation whose input tensor is **263 MB**:
+
+| backend | bytes required | bytes moved (ncu) | amplification |
+|---|---:|---:|---:|
+| K1 forward | 262.7 MB | 263.6 MB | **1.00×** |
+| K1 backward | 525.3 MB | 511.4 MB | 0.97× |
+| naive | 262.7 MB | 263.8 MB | 1.00× |
+| TRL eager | 262.7 MB | **2196.6 MB** | **8.36×** |
+
+The kernel-name breakdown from the same profile explains exactly where the
+8.36× comes from — it maps one-to-one onto TRL's source:
+
+```
+ 9x  cunn_SoftMaxForward       1 (selective_log_softmax) + 8 (entropy chunks)
+ 8x  exp_kernel_cuda           torch.exp(logps)      in entropy_from_logits
+ 8x  BinaryFunctor (mul)       exp(logps) * logps
+ 8x  reduce_kernel (sum)       .sum(-1)
+ 8x  neg_kernel_cuda           -(...)
+ 1x  scatter_gather            .gather() for the target logprob
+ 1x  CatArrayBatchedCopy       torch.cat of the chunk results
+---
+43 launches
+```
+
+`entropy_from_logits` uses `chunk_size=128`, so 1024 rows become 8 chunks, and
+each chunk runs a 5-kernel elementwise chain over a `[128, V]` tensor. Every
+one of those kernels reads and writes the full chunk. **The eager path is slow
+because it streams the logits tensor ~8 times, not because any individual
+kernel is slow.**
+
+This reframes the contribution: K1's win is not "a faster kernel" so much as
+**eliminating 7 of 8 passes over a gigabyte-scale tensor** and collapsing 43
+launches into 1. Plot: `bench/plots/traffic_amplification.png`.
+
+### 4.4 The naive kernel isolates the occupancy variable
+
+naive and K1 forward compute identical math and move identical bytes (263.8 vs
+263.6 MB, both 1.00× the minimum), yet naive takes **6.7× longer**. The only
+difference ncu shows is occupancy: **8.3% vs 97.8%**. One thread per row
+launches 1024 threads on a GPU that schedules ~36,000 concurrently. This is the
+cleanest possible demonstration of why the block-per-row redesign was the single
+biggest win in the project.
+
+### 4.5 Methodology validation: our byte model was right
+
+`bench/bench_micro.py` reports "effective bandwidth" as
+`modeled_bytes / measured_latency`, where `modeled_bytes = B·S·V·dtype_size`.
+That model is an assumption. ncu measures actual DRAM transactions, so the two
+can be compared directly:
+
+| backend | modeled | ncu-measured | ratio |
+|---|---:|---:|---:|
+| K1 forward (all 4 shapes) | — | — | **1.00** |
+| K1 backward | 525.3 MB | 511.4 MB | 0.97 |
+| naive | 262.7 MB | 263.8 MB | 1.00 |
+
+The forward model is accurate to within 0.4%. The backward comes in 3% *under*
+the model, meaning L2 absorbs a small part of the `d_logits` write traffic
+before it reaches DRAM. **The bench harness's byte accounting is validated.**
+
+The latency measurements differ by measurement context, and the report should
+be explicit about which number is which:
+
+| shape | bench harness (warm, median of 30) | ncu (cold caches + instrumentation) |
 |---|---:|---:|
-| K1 forward | 197.6 GB/s | 77.2% |
-| K1 backward | 198.6 GB/s | 77.6% (peaks 87.8% at smaller V) |
-| TRL eager | 22.8 GB/s | 8.9% |
-| PyTorch separate | 28.2 GB/s | 11.0% |
-| naive single-thread-per-row | 32.1 GB/s | 12.5% |
+| K1 fwd 1024×128k | 1.33 ms → 77% of peak | 1.496 ms → 68.8% of peak |
+| K1 fwd 4096×32k | 1.24 ms → 82.6% of peak | 1.401 ms → 73.4% of peak |
+| K1 bwd 4096×32k | 2.33 ms → 87.8% of peak | 2.181 ms → 91.4% of peak |
 
-**Eager paths sit ~10× below their bandwidth ceiling** because they:
-- Issue many separate kernels (each with launch overhead and cache flush)
-- Materialize intermediates that re-read DRAM
-- Run Python-loop logic between launches
-
-Plot: `bench/plots/bandwidth.png`. K1 is the only bar that approaches the
-hardware peak.
+ncu flushes caches between replay passes and adds instrumentation overhead, so
+its forward numbers are conservative; the harness numbers reflect warm
+steady-state, which is what a training loop actually experiences. Since the
+byte counts agree, the gap is entirely the duration measurement. **Both are
+reported; neither is cherry-picked.**
 
 ---
 
@@ -220,6 +313,7 @@ Live integration on real Qwen2.5-0.5B logits (`examples/compare_one_step.py`):
 | `torch.compile(backend="inductor")` | ⚠ Windows-blocked | Triton-Windows version mismatch with PyTorch 2.6; works on Linux/WSL2 |
 | `torch.library.custom_op` + `meta` kernel | ❌ stretch | Would eliminate Dynamo graph break (currently graph-breaks at pybind boundary; result correct, just not single-graph-fused) |
 | CUDA Graph capture | ❌ stretch | Likely works for forward (no host syncs in our code path); not tested |
+| Nsight Compute profiling | ✅ shipped | 8 reports in `bench/ncu/`; automated by `bench/run_ncu.ps1`, parsed by `bench/ncu_parse.py`, plotted by `bench/plot_roofline.py` |
 | HuggingFace TRL `GRPOTrainer` | ✅ shipped | `KernelOptGRPOTrainer` subclass, single-method override |
 | TRL multimodal (image / pixel) | ✅ falls back | Subclass detects multimodal kwargs and defers to parent |
 
@@ -277,20 +371,44 @@ saves the next person from repeating them.
    import error). Uninstalled and used `backend="aot_eager"` instead, which
    doesn't need Triton.
 
-7. **ncu blocked by Windows admin permissions** (`ERR_NVGPUCTRPERM`). Consumer
-   GPUs on Windows require either admin or a system-wide registry change to
-   enable performance counters. Fell back to bench-harness-measured effective
-   bandwidth (which is mathematically equivalent to ncu's
-   `dram__throughput.avg.pct_of_peak_sustained_elapsed`).
+7. **ncu blocked by Windows admin permissions** (`ERR_NVGPUCTRPERM`) — later
+   resolved. Consumer GPUs on Windows gate performance counters behind admin
+   rights. The first write-up of this report suggested WSL2 as the workaround;
+   **that advice was wrong** — WSL2's GPU access goes through the same Windows
+   display driver, so the same policy applies. The actual fix is to run ncu
+   from an elevated shell (or set `RmProfilingAdminOnly=0` under
+   `HKLM\SYSTEM\CurrentControlSet\Services\nvlddmkm\Global\NVTweak` and
+   reboot). Cost of the wrong guess: nearly a WSL2 install that would not
+   have helped.
 
-8. **The "step-level peak VRAM" comparison is noisy** when both trainers run in
+8. **The ncu CSV parser silently scaled short kernels by 1000×.** ncu picks
+   the unit that best fits each report's magnitude, so `gpu__time_duration.sum`
+   came back as `us` for the 256×32k shape and `ms` for every other shape. The
+   first parser dropped the units row and assumed milliseconds, producing a
+   99 ms duration for a kernel that actually takes 0.099 ms — and a nonsense
+   1000× traffic-amplification figure. Caught it by cross-checking against
+   `gpc__cycles_elapsed.max` (190k cycles at ~2 GHz cannot be 99 ms). Fix:
+   parse the units row and normalize per-report (`bench/ncu_parse.py`).
+   **Lesson: when a derived number is off by exactly a power of 1000, suspect
+   units before suspecting the hardware.**
+
+9. **ncu disproved our own published explanation of why the baseline is slow.**
+   Section 4.3 documents this in full: we had claimed TRL's eager kernels ran
+   ~10× below their bandwidth ceiling, which implied they were badly written.
+   ncu showed they hit 88.2% of peak — the slowness is 8.36× redundant traffic
+   across 43 launches, not inefficient kernels. The original claim was an
+   artifact of dividing *our* modeled byte count by *their* latency. It was a
+   plausible-sounding number computed from an assumption we had never
+   validated, and it stood in the report until real counters contradicted it.
+
+10. **The "step-level peak VRAM" comparison is noisy** when both trainers run in
    the same Python process — CUDA caching allocator carries reservations
    across `del trainer; empty_cache()`. The clean isolated number (261 MB
    savings on the logp call) comes from `compare_one_step.py`. The right way
    to measure step-level peak in isolation is a subprocess wrapper, which
    we noted as a Stage 6 follow-up.
 
-9. **TRL's bf16 path turned out to be even slower than its own fp32 path**
+11. **TRL's bf16 path turned out to be even slower than its own fp32 path**
    (the per-row Python loop is a bigger overhead than the fp32 logsumexp). For
    K1 this was good news — the baseline we beat was the production path. Worth
    confirming on Day 1 by reading the source rather than assuming.

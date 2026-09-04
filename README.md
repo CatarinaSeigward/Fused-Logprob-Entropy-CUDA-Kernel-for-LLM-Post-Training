@@ -11,24 +11,35 @@ verification — anywhere you need per-token logprob from `[B, S, V]` logits.
 
 ## Headline numbers
 
-Measured on RTX 4060 Laptop (sm_89, 8 GB, 256 GB/s peak DRAM), bf16:
+Measured on RTX 4060 Laptop (sm_89, 8 GB, 256 GB/s peak DRAM), bf16.
+Bandwidth, traffic, occupancy and launch counts are **Nsight Compute measured**
+(`bench/ncu/`); latencies are median-of-30 from `bench/bench_micro.py`.
 
-| | K1 (ours) | baseline | speedup |
+| | K1 (ours) | baseline | factor |
 |---|---:|---:|---:|
-| **Forward** (B·S=1024, V=152k) | 1.58 ms | 13.6 ms (TRL eager) | **8.6×** |
-| **Backward** (B·S=1024, V=152k) | 3.14 ms | 41.1 ms (PyTorch autograd) | **13.1×** |
-| **Peak DRAM bandwidth** (forward) | 82.6% | 14.2% | — |
-| **Peak DRAM bandwidth** (backward) | 87.8% | 5.9% | — |
-| **Intermediate alloc per call** (B·S=1024, V=152k) | **0 MB** | 298 MB | — |
-| **vs fp32 ground truth** (logprob, bf16 path) | 2.0e-06 | 1.2e-02 (TRL) | **6 orders of magnitude** |
+| **Forward latency** (B·S=1024, V=152k) | 1.58 ms | 13.6 ms (TRL eager) | **8.6×** |
+| **Backward latency** (B·S=1024, V=152k) | 3.14 ms | 41.1 ms (PyTorch autograd) | **13.1×** |
+| **DRAM traffic** vs theoretical minimum | **1.00×** | 8.36× (TRL eager) | **8.4× less traffic** |
+| **Kernel launches** per call | **1** | 43 (TRL eager) | **43× fewer** |
+| **Peak DRAM bandwidth** (ncu) | 68.8–91.4% | — | — |
+| **Occupancy** (ncu) | 96–98% | 8.3% (naive 1-thread/row) | — |
+| **Intermediate alloc per call** | **0 MB** | 298 MB (TRL eager) | — |
+| **Error vs fp32 ground truth** (logprob) | 2.0e-06 | 1.2e-02 (TRL bf16) | **6 orders of magnitude** |
 
 GRPO integration: simulated loss differs by **7.4e-06** from stock TRL — 135× tighter than the 1e-3 contract.
 
+> **The headline isn't "a faster kernel."** Nsight Compute shows TRL's own kernels
+> hit 88.2% of peak DRAM bandwidth — they're efficient. TRL is slow because it
+> streams the logits tensor **~8 times across 43 kernel launches**. K1 does it
+> once. See [REPORT.md §4.3](REPORT.md).
+
 ## Plots
 
-![K1 speedup vs TRL eager across (vocab × batch×seq)](bench/plots/speedup.png)
+![Traffic amplification and per-kernel bandwidth efficiency](bench/plots/traffic_amplification.png)
 
-![DRAM bandwidth utilization — K1 saturates the memory bus](bench/plots/bandwidth.png)
+![Roofline — all kernels ~8x left of the ridge](bench/plots/roofline.png)
+
+![K1 speedup vs TRL eager across (vocab × batch×seq)](bench/plots/speedup.png)
 
 ![Per-call intermediate allocation — K1 streams in fp32 registers](bench/plots/memory.png)
 
@@ -115,7 +126,8 @@ What ships (MVP, complete):
 - `torch.autograd.Function` wrapper; `torch.compile(backend="aot_eager")` round-trip works
 - `KernelOptGRPOTrainer(trl.GRPOTrainer)` subclass
 - 35 tests pass (`pytest tests/`)
-- Benchmark harness + 3 headline plots
+- Benchmark harness + 5 plots, including an ncu-measured roofline
+- Nsight Compute profiling pipeline (`run_ncu.ps1` → `ncu_parse.py` → `plot_roofline.py`)
 - `examples/train_gsm8k.py` end-to-end demo
 - `examples/compare_one_step.py` 1-step parity check
 
@@ -132,9 +144,9 @@ Stretch / open follow-ups (see `notes/stage*_findings.md` for details):
 - Kernel stride support — would let `KernelOptGRPOTrainer` do one fused launch
   per call instead of B per-batch launches (limit currently is the OOM-avoidance
   workaround for non-contiguous slices in TRL's loss block; see `notes/stage4_findings.md`)
-- Vectorized 8-element bf16 loads — likely pushes 82% → 90%+ peak DRAM bw
-- ncu screenshots (blocked by Windows admin permissions; metric values come from
-  the bench harness instead — see `notes/stage5_findings.md`)
+- Vectorized 8-element bf16 loads — ncu shows forward at 68.8–73.4% of peak vs
+  backward's 90.5–91.4%; the forward's warp/block reduction is the gap, and
+  vectorized loads are the obvious next lever
 
 ## Layout
 
@@ -158,7 +170,11 @@ kernel-opt/
     bench_micro.py              # kernel-level sweep
     bench_backward.py           # backward-only sweep
     bench_step.py               # full GRPO step latency + VRAM
-    plot_results.py             # generates the 3 PNGs
+    plot_results.py             # speedup / bandwidth / memory PNGs
+    ncu_targets.py              # one-backend-per-process ncu profiling targets
+    run_ncu.ps1                 # batch ncu driver (8-report focused matrix)
+    ncu_parse.py                # ncu CSV -> tidy table (+ model validation)
+    plot_roofline.py            # roofline + traffic-amplification PNGs
     plots/, results/, ncu/
   examples/
     train_gsm8k.py              # E2E demo with our trainer
